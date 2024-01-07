@@ -1,0 +1,9 @@
+scipy
+numpy
+pydub
+librosa
+sounddevice
+
+torchaudio
+
+openai

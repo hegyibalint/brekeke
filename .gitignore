@@ -1,0 +1,10 @@
+# Local-dev env files
+.env
+
+# Python
+venv/
+
+# Test audio files
+*.wav
+*.mp3
+*.webm
