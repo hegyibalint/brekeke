@@ -1,22 +1,34 @@
 import io
 import os
-import datetime
 from time import sleep
 
 import numpy as np
 
-import librosa
 import pydub
 import sounddevice as sd
 
-import torchaudio
-
-import torch
 import openai
+from openai.types.beta import Thread
 
-# import RPi.GPIO
+try:
+    import RPi.GPIO
 
-torch.set_num_threads(1)
+    def setup_input():
+        RPi.GPIO.setmode(RPi.GPIO.BCM)
+        RPi.GPIO.setup(RESPEAKER_BUTTON, RPi.GPIO.IN, pull_up_down=RPi.GPIO.PUD_UP)
+
+    def wait_for_input():
+        RPi.GPIO.wait_for_edge(RESPEAKER_BUTTON, RPi.GPIO.FALLING)
+
+except ImportError:
+
+    def setup_input():
+        print("RPi.GPIO not found, using keyboard input instead.")
+        pass
+
+    def wait_for_input():
+        return input("Press enter to continue...")
+
 
 RESPEAKER_BUTTON = 17
 
@@ -26,16 +38,21 @@ client = openai.OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY"),
 )
 
-print("Loading VAD model...")
-vad_model, (
-    get_speech_timestamps,
-    save_audio,
-    read_audio,
-    VADIterator,
-    collect_chunks,
-) = torch.hub.load(
-    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True
-)
+
+def synthetize_response(response: str) -> io.BytesIO:
+    """
+    Synthetize the response and return it as a BytesIO object.
+    """
+    # Synthesize the response
+    response = client.audio.speech.create(
+        input=response,
+        model="tts-1",
+        voice="onyx",
+        response_format="aac",
+    )
+    # Play the response
+    audio_file = io.BytesIO(response.content)
+    return audio_file
 
 
 def read_audio(wav: np.array, sampling_rate: int = 16000):
@@ -55,127 +72,145 @@ def record() -> io.BytesIO:
     Record audio from the microphone and return it as a WebM file.
     """
     SAMPLE_RATE = 16000
-    FRAME_SIZE = 512
+    DURATION = 2
     CHANNELS = 1
-    INT16_MAX = np.iinfo(np.int16).max
 
-    vad_iterator = VADIterator(vad_model)
-    samples = np.array([], dtype=np.int16)
-
-    with sd.InputStream(
+    samples = sd.rec(
+        int(DURATION * SAMPLE_RATE),
         samplerate=SAMPLE_RATE,
-        blocksize=FRAME_SIZE,
         channels=CHANNELS,
-    ) as stream:
-        print("Recording...")
-        while True:
-            frame, overflowed = stream.read(FRAME_SIZE)
-            if overflowed:
-                print("Overflowed!!!")
-            frame = frame.flatten()
-            # frame = (frame * INT16_MAX).astype(np.int16)
+        dtype="int16",
+    )
+    sd.wait()
 
-            asd = vad_iterator(frame, return_seconds=True)
-            if asd:
-                print(asd)
-
-    # # Convert to WebM
-    # samples = pydub.AudioSegment(
-    #     samples,
-    #     frame_rate=SAMPLE_RATE,
-    #     sample_width=samples.,
-    #     channels=CHANNELS,
-    # )
-    # # Save to a file
-    # audio_file = samples.export(format="webm", codec="libopus").read()
-    # buffer = io.BytesIO(audio_file)
-    # buffer.name = "audio.webm"
-    # return buffer
+    # Convert to WebM
+    segment = pydub.AudioSegment(
+        samples,
+        frame_rate=SAMPLE_RATE,
+        sample_width=2,
+        channels=CHANNELS,
+    )
+    # Save to a file
+    audio_file = segment.export(format="webm", codec="libopus").read()
+    buffer = io.BytesIO(audio_file)
+    buffer.name = "audio.webm"
+    return buffer
 
 
-def handle_conversation():
+def get_samples(audio: io.BytesIO, format="aac", codec=None) -> np.array:
+    """
+    Get the samples from an audio file, which can be played by sounddevice.
+    """
+    # Play the response
+    samples = pydub.AudioSegment.from_file(audio, format=format, codec=codec)
+    samples = samples.set_frame_rate(44100)
+    return samples.get_array_of_samples()
+
+
+def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bool:
+    """
+    Handle a conversation with the user.
+
+    Returns True if the conversation finished, False otherwise.
+    """
+
     ASSISTANT_ID = "asst_zmxagj83hfxswc1MSImQv4A1"
 
-    while True:
-        print("Recording...")
-        webm_file = record()
-        # Upload the file to OpenAI
-        print("Uploading...")
-        response = client.audio.transcriptions.create(
-            file=webm_file, model="whisper-1", response_format="text"
-        )
-        print(response)
+    print("Recording...")
+    webm_file = record()
+    # Upload the file to OpenAI
+    print("Uploading...")
+    response = client.audio.transcriptions.create(
+        file=webm_file, model="whisper-1", response_format="text"
+    )
+    print(response)
 
-        # If we hear "thank you", stop the conversation
-        if response.lower().contains("thank you") or response.lower().contains(
-            "thanks"
-        ):
-            break
-
-        # Create a new thread for this conversation
-        thread = client.beta.threads.create()
-        # Add a message to this conversation's thread
-        client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=response,
-        )
-
-        # Invoke the assistant
-        run = client.beta.threads.runs.create(
-            assistant_id=ASSISTANT_ID, thread_id=thread.id
-        )
-
-        # Wait for the run to complete
-        finished = False
-        print("===========================")
-        while not finished:
-            run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-            print(run)
-            print("---------------------------")
-            messages = client.beta.threads.messages.list(thread_id=thread.id)
-            print(messages)
-            if run.status == "completed":
-                finished = True
-
-        # Print the response
-        print("Response:")
-        messages = client.beta.threads.messages.list(thread_id=thread.id)
-        last_message = messages.data[0].content[0].text.value
-
-        # Synthesize the response
-        response = client.audio.speech.create(
-            input=last_message,
-            model="tts-1",
-            voice="onyx",
-            response_format="aac",
-        )
-        # Play the response
-        audio_file = io.BytesIO(response.content)
-        # Play the response
-        samples = pydub.AudioSegment.from_file(audio_file, format="aac")
-        samples = samples.set_frame_rate(44100)
-        # Play the response
-        sd.play(samples.get_array_of_samples())
+    # If we hear "thank you", stop the whole conversation
+    lowercase_response = response.lower()
+    if "thank you" in lowercase_response or "thanks" in lowercase_response:
+        # Play the welcome message
+        sd.play(welcome_message_samples)
         sd.wait()
+        return True
+
+    # Add a message to this conversation's thread
+    client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=response,
+    )
+
+    # Invoke the assistant
+    run = client.beta.threads.runs.create(
+        assistant_id=ASSISTANT_ID, thread_id=thread.id
+    )
+
+    # Wait for the run to complete
+    finished = False
+    print("===========================")
+    while not finished:
+        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+        print(run)
+        print("---------------------------")
+        messages = client.beta.threads.messages.list(thread_id=thread.id)
+        print(messages)
+        if run.status == "completed":
+            finished = True
+
+    # Print the response
+    print("Response:")
+    messages = client.beta.threads.messages.list(thread_id=thread.id)
+    last_message = messages.data[0].content[0].text.value
+
+    # Synthesize the response
+    response = client.audio.speech.create(
+        input=last_message,
+        model="tts-1",
+        voice="onyx",
+        response_format="aac",
+    )
+    samples = get_samples(io.BytesIO(response.content), "aac")
+    # Play the response
+    sd.play(samples)
+    sd.wait()
+
+    return False
 
 
-print("Setting up GPIO...")
-# Setup GPIO14 as input with pull-down resistor
-# RPi.GPIO.setmode(RPi.GPIO.BCM)
-# RPi.GPIO.setup(RESPEAKER_BUTTON, RPi.GPIO.IN, pull_up_down=RPi.GPIO.PUD_DOWN)
-# Add event handler
-# RPi.GPIO.add_event_detect(RESPEAKER_BUTTON, RPi.GPIO.RISING, callback=button_pressed)
+def get_welcome_message() -> io.BytesIO:
+    WELCOME_FILE = "cache/welcome.aac"
 
-# Wait forever
-# while True:
-# Block until the button is pressed
-# print("Waiting for button press...")
-# RPi.GPIO.wait_for_edge(RESPEAKER_BUTTON, RPi.GPIO.RISING)
-# input("Press enter to continue...")
-# handle_conversation()
+    # If welcome.aac doesn't exist, create it
+    if not os.path.exists(WELCOME_FILE):
+        # Synthetize the welcome message
+        print("Synthetizing the welcome message...")
+        welcome_response = synthetize_response("You are welcome!")
+        # Save the welcome message
+        with open(WELCOME_FILE, "wb") as f:
+            f.write(welcome_response.read())
 
-buffer = record()
-# Save to a file
-with open("audio.webm", "wb") as f:
-    f.write(buffer.read())
+    # Return the welcome message
+    return io.BytesIO(open(WELCOME_FILE, "rb").read())
+
+
+def main():
+    setup_input()
+
+    # Make the cache/ directory if it doesn't exist
+    if not os.path.exists("cache"):
+        os.mkdir("cache")
+
+    welcome_message_samples = get_samples(get_welcome_message(), "aac")
+    thread = client.beta.threads.create()
+    while True:
+        wait_for_input()
+        if handle_conversation(thread, welcome_message_samples):
+            # If the conversation finished, we start a new thread
+            print("Starting a new thread...")
+            thread = client.beta.threads.create()
+        else:
+            print("Continuing the conversation...")
+
+
+if __name__ == "__main__":
+    main()
