@@ -18,6 +18,7 @@ try:
         RPi.GPIO.setup(RESPEAKER_BUTTON, RPi.GPIO.IN, pull_up_down=RPi.GPIO.PUD_UP)
 
     def wait_for_input():
+        print("Waiting for button press...")
         RPi.GPIO.wait_for_edge(RESPEAKER_BUTTON, RPi.GPIO.FALLING)
 
 except ImportError:
