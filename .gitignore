@@ -4,7 +4,11 @@
 # Python
 venv/
 
+# Cache audio files
+cache/
+
 # Test audio files
 *.wav
 *.mp3
 *.webm
+*.aac
