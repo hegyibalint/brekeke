@@ -3,5 +3,7 @@ numpy
 pydub
 librosa
 sounddevice
+torch
 torchaudio
+onnxruntime
 openai
