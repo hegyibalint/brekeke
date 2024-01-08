@@ -1,17 +1,19 @@
 import io
 import os
-from time import sleep
+from time import sleep, time
 
 import numpy as np
-
 import pydub
 import sounddevice as sd
-
+import torch
 import openai
 from openai.types.beta import Thread
 
 from apa102 import APA102
 
+# Conditional import for input handling
+#  - If RPi.GPIO is available, use the hardware button
+#  - Otherwise, use the keyboard
 try:
     import RPi.GPIO
 
@@ -33,18 +35,58 @@ except ImportError:
         return input("Press enter to continue...")
 
 
+# =============================================================================
+# Constants
+# =============================================================================
+
 RESPEAKER_BUTTON = 17
 
-# OpenAI API key
+
+# =============================================================================
+# Global variables and initialization
+# =============================================================================
+
+torch.set_num_threads(1)
+
+# OpenAI
 client = openai.OpenAI(
     # This is the default and can be omitted
     api_key=os.environ.get("OPENAI_API_KEY"),
 )
 
+# LED strip
+led_strip = APA102(3)
+
+print("Loading the VAD model...")
+vad_model, (
+    get_speech_timestamps,
+    save_audio,
+    read_audio,
+    VADIterator,
+    collect_chunks,
+) = torch.hub.load(
+    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True, onnx=True
+)
+
+
+# =============================================================================
+# Functions
+# =============================================================================
+
+
+def get_samples(audio: io.BytesIO, format="aac", codec=None) -> np.array:
+    """
+    Get the samples from an audio file, which can be played by sounddevice.
+    """
+    # Play the response
+    samples = pydub.AudioSegment.from_file(audio, format=format, codec=codec)
+    samples = samples.set_frame_rate(44100)
+    return samples.get_array_of_samples()
+
 
 def synthetize_response(response: str) -> io.BytesIO:
     """
-    Synthetize the response and return it as a BytesIO object.
+    Synthetize the response and return an AAC file wrapped in a BytesIO object.
     """
     # Synthesize the response
     response = client.audio.speech.create(
@@ -58,63 +100,50 @@ def synthetize_response(response: str) -> io.BytesIO:
     return audio_file
 
 
-def read_audio(wav: np.array, sampling_rate: int = 16000):
-    # wav, sr = torchaudio.load(path)
-    if wav.size(0) > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    if sr != sampling_rate:
-        transform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sampling_rate)
-        wav = transform(wav)
-        sr = sampling_rate
-    assert sr == sampling_rate
-    return wav.squeeze(0)
-
-
 def record() -> io.BytesIO:
     """
-    Record audio from the microphone and return it as a WebM file.
+    Record audio from the microphone and return it as a WebM file wrapped in a BytesIO object.
     """
     SAMPLE_RATE = 16000
-    DURATION = 2
-    CHANNELS = 1
+    FRAME_SIZE = 1024
+    CHANNELS = 2
 
-    samples = sd.rec(
-        int(DURATION * SAMPLE_RATE),
+    # Reset the VAD model before recording
+    vad_model.reset_states()
+
+    # Start streaming
+    with sd.InputStream(
         samplerate=SAMPLE_RATE,
+        blocksize=FRAME_SIZE,
         channels=CHANNELS,
         dtype="int16",
-    )
-    sd.wait()
+    ) as stream:
+        while True:
+            frame_i16, overflow = stream.read(FRAME_SIZE)
+            if overflow:
+                print("Overflow!")
 
-    # Convert to WebM
-    segment = pydub.AudioSegment(
-        samples,
-        frame_rate=SAMPLE_RATE,
-        sample_width=2,
-        channels=CHANNELS,
-    )
-    # Save to a file
-    audio_file = segment.export(format="webm", codec="libopus").read()
-    buffer = io.BytesIO(audio_file)
-    buffer.name = "audio.webm"
-    return buffer
+            # Convert the stereo audio to mono
+            frame_i16 = frame_i16.mean(axis=1)
+            frame_f32 = (frame_i16 / 32768).astype("float32")
 
-
-def get_samples(audio: io.BytesIO, format="aac", codec=None) -> np.array:
-    """
-    Get the samples from an audio file, which can be played by sounddevice.
-    """
-    # Play the response
-    samples = pydub.AudioSegment.from_file(audio, format=format, codec=codec)
-    samples = samples.set_frame_rate(44100)
-    return samples.get_array_of_samples()
+            speech_probability = vad_model(torch.from_numpy(frame_f32), sr=SAMPLE_RATE)[
+                0
+            ][0]
+            if speech_probability > 0.5:
+                print(f"Speech detected! {time()}")
 
 
 def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bool:
     """
     Handle a conversation with the user.
 
-    Returns True if the conversation finished, False otherwise.
+    Args:
+        thread: The thread to use for the conversation.
+        welcome_message_samples: The samples of the welcome message, which will be played at the end of the conversation.
+
+    Returns:
+        True if the conversation finished, False otherwise.
     """
 
     ASSISTANT_ID = "asst_zmxagj83hfxswc1MSImQv4A1"
@@ -196,6 +225,11 @@ def get_welcome_message() -> io.BytesIO:
     return io.BytesIO(open(WELCOME_FILE, "rb").read())
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main():
     setup_input()
 
@@ -216,4 +250,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    record()
