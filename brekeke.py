@@ -46,8 +46,6 @@ RESPEAKER_BUTTON = 17
 # Global variables and initialization
 # =============================================================================
 
-torch.set_num_threads(1)
-
 # OpenAI
 client = openai.OpenAI(
     # This is the default and can be omitted
@@ -57,6 +55,8 @@ client = openai.OpenAI(
 # LED strip
 led_strip = APA102(3)
 
+# VAD model
+torch.set_num_threads(1)
 print("Loading the VAD model...")
 vad_model, (
     get_speech_timestamps,
@@ -65,7 +65,7 @@ vad_model, (
     VADIterator,
     collect_chunks,
 ) = torch.hub.load(
-    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True, onnx=True
+    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True
 )
 
 
@@ -105,33 +105,81 @@ def record() -> io.BytesIO:
     Record audio from the microphone and return it as a WebM file wrapped in a BytesIO object.
     """
     SAMPLE_RATE = 16000
-    FRAME_SIZE = 1024
+    FRAME_SIZE = 8000
     CHANNELS = 2
+
+    # Number of quiet frames before we stop recording
+    # 1024 *
+    NUM_MAX_QUITE_SAMPLES = int(16000 * 1.5)
 
     # Reset the VAD model before recording
     vad_model.reset_states()
+    # Frames of audio being recorded
+    recorded_frames = None
+    # Whether we are recording or not
+    is_recording = False
+    # Number of quiet frames
+    quiet_samples = 0
 
     # Start streaming
+    print("Recording...")
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
-        blocksize=FRAME_SIZE,
         channels=CHANNELS,
         dtype="int16",
     ) as stream:
         while True:
+            print("Reading...")
             frame_i16, overflow = stream.read(FRAME_SIZE)
             if overflow:
                 print("Overflow!")
 
             # Convert the stereo audio to mono
-            frame_i16 = frame_i16.mean(axis=1)
-            frame_f32 = (frame_i16 / 32768).astype("float32")
+            frame_i16 = np.mean(frame_i16, axis=1, dtype="int16")
+            # Create a float32 version of the frame (required by the VAD model)
+            frame_f32 = (frame_i16 / 32768.0).astype("float32")
 
-            speech_probability = vad_model(torch.from_numpy(frame_f32), sr=SAMPLE_RATE)[
-                0
-            ][0]
-            if speech_probability > 0.5:
-                print(f"Speech detected! {time()}")
+            # Run the VAD model
+            # model_out = vad_model(torch.from_numpy(frame_f32), sr=SAMPLE_RATE)
+            # Get the probability of speech
+            # speech_prob = model_out[0][0]
+            speech_prob = 0.1
+
+            if not is_recording and speech_prob > 0.5:
+                print("Voice detected, start recording...")
+                is_recording = True
+
+            if is_recording:
+                # We check (with less sensitivity) if there is still speech
+                if speech_prob < 0.5:
+                    quiet_samples += len(frame_i16)
+                else:
+                    # If there is speech, we reset the counter
+                    quiet_samples = 0
+            else:
+                # If we are not recording we still store the current frame, as it might contain the start of a sentence
+                recorded_frames = frame_i16
+
+            # If there are more than 10 quiet frames we consider the recording complete, and break the loop
+            if quiet_samples > NUM_MAX_QUITE_SAMPLES:
+                print("Voice stopped, stop recording...")
+                break
+
+            # Add the frame to the recording
+            recorded_frames = np.append(recorded_frames, frame_i16)
+
+    # Convert to WebM
+    segment = pydub.AudioSegment(
+        recorded_frames,
+        frame_rate=SAMPLE_RATE,
+        sample_width=2,
+        channels=1,
+    )
+    audio_file = segment.export(format="webm", codec="libopus").read()
+    # Wrap the WebM file in a BytesIO object, so we can use it as a file
+    buffer = io.BytesIO(audio_file)
+    buffer.name = "recording.webm"
+    return buffer
 
 
 def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bool:
@@ -148,7 +196,6 @@ def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bo
 
     ASSISTANT_ID = "asst_zmxagj83hfxswc1MSImQv4A1"
 
-    print("Recording...")
     webm_file = record()
     # Upload the file to OpenAI
     print("Uploading...")
@@ -238,17 +285,18 @@ def main():
         os.mkdir("cache")
 
     welcome_message_samples = get_samples(get_welcome_message(), "aac")
-    thread = client.beta.threads.create()
     while True:
         wait_for_input()
-        if handle_conversation(thread, welcome_message_samples):
-            # If the conversation finished, we start a new thread
-            print("Starting a new thread...")
-            thread = client.beta.threads.create()
-        else:
+        print("Starting a new thread...")
+        thread = client.beta.threads.create()
+        while not handle_conversation(thread, welcome_message_samples):
             print("Continuing the conversation...")
 
 
 if __name__ == "__main__":
-    # main()
-    record()
+    main()
+    # while True:
+    #     webm = record()
+    #     # Play the response
+    #     sd.play(get_samples(webm, "webm", "libopus"))
+    #     sd.wait()
