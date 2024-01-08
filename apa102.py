@@ -39,17 +39,22 @@ class APA102:
     def __del__(self) -> None:
         self.spi.close()
 
-    def set_led(self, led: int, r: int, g: int, b: int, brightness=None) -> None:
-        self.colors[led] = RgbbColor(r, g, b, brightness)
-        self.update_colors()
-
     def __getitem__(self, led: int) -> RgbbColor:
         return self.colors[led]
 
     def __setitem__(self, led: int, color: RgbbColor) -> None:
         self.colors[led] = color
 
-    def update_colors(self) -> None:
+    def set_all_leds(self, r: int, g: int, b: int, brightness=None) -> None:
+        for i in range(len(self.colors)):
+            self.set_led(i, r, g, b, brightness)
+        self._update_colors()
+
+    def set_led(self, led: int, r: int, g: int, b: int, brightness=None) -> None:
+        self.colors[led] = RgbbColor(r, g, b, brightness)
+        self._update_colors()
+
+    def _update_colors(self) -> None:
         """
         Send the current colors to the LED strip
         """
@@ -75,7 +80,7 @@ def test() -> None:
         led_strip[0] = RgbbColor(millis % 128, 0, 0, 1)
         led_strip[1] = RgbbColor(0, millis % 128, 0, 1)
         led_strip[2] = RgbbColor(0, 0, millis % 128, 1)
-        led_strip.update_colors()
+        led_strip._update_colors()
         sleep(0.1)
 
 
