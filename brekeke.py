@@ -10,6 +10,8 @@ import sounddevice as sd
 import openai
 from openai.types.beta import Thread
 
+from apa102 import APA102
+
 try:
     import RPi.GPIO
 
