@@ -1,5 +1,6 @@
 import io
 import os
+from queue import Queue
 from time import sleep, time
 
 import numpy as np
@@ -41,6 +42,18 @@ except ImportError:
 
 RESPEAKER_BUTTON = 17
 
+# Sample rate of the audio
+RECORDING_SAMPLE_RATE = 16000
+# How big each frame should be, which the callback will receive
+RECORDING_FRAME_SIZE = 1024
+# Number of channels to record
+RECORDING_CHANNELS = 2
+# Number of quiet samples before we stop recording
+NUM_MAX_QUITE_SAMPLES = int(RECORDING_SAMPLE_RATE * 1)  # 1 second
+
+# Siliero VAD model works the best with multiples of 512-sample frames
+if RECORDING_FRAME_SIZE % 512 != 0:
+    raise ValueError("FRAME_SIZE must be a multiple of 512")
 
 # =============================================================================
 # Global variables and initialization
@@ -68,19 +81,22 @@ vad_model, (
     repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=True
 )
 
+# Queue storing the recorded audio frames coming from the recording callback
+recording_queue: Queue = None
+
 
 # =============================================================================
 # Functions
 # =============================================================================
 
 
-def get_samples(audio: io.BytesIO, format="aac", codec=None) -> np.array:
+def get_samples(audio: io.BytesIO, format="aac", codec=None, sr=44100) -> np.array:
     """
     Get the samples from an audio file, which can be played by sounddevice.
     """
     # Play the response
     samples = pydub.AudioSegment.from_file(audio, format=format, codec=codec)
-    samples = samples.set_frame_rate(44100)
+    samples = samples.set_frame_rate(sr)
     return samples.get_array_of_samples()
 
 
@@ -100,86 +116,114 @@ def synthetize_response(response: str) -> io.BytesIO:
     return audio_file
 
 
+def record_callback(indata, frames, time, status):
+    global recording_queue
+
+    if recording_queue:
+        recording_queue.put(indata.copy())
+
+
+def start_recording() -> io.BytesIO:
+    """
+    Starts recording audio from the microphone and returns an InputStream object.
+    """
+
+    # Start streaming
+    print("Setting up recording...")
+    return sd.InputStream(
+        samplerate=RECORDING_SAMPLE_RATE,
+        channels=RECORDING_CHANNELS,
+        blocksize=RECORDING_FRAME_SIZE,
+        dtype="int16",
+        callback=record_callback,
+    )
+
+
 def record() -> io.BytesIO:
     """
     Record audio from the microphone and return it as a WebM file wrapped in a BytesIO object.
     """
-    SAMPLE_RATE = 16000
-    FRAME_SIZE = 8000
-    CHANNELS = 2
+    global recording_queue
 
-    # Number of quiet frames before we stop recording
-    # 1024 *
-    NUM_MAX_QUITE_SAMPLES = int(16000 * 1.5)
+    # The last number of recorded samples we keep, regardless of whether they is speech or not
+    # This is done to avoid cutting the audio when we stop recording
+    KEPT_SAMPLES = int(RECORDING_SAMPLE_RATE * 0.5)
 
     # Reset the VAD model before recording
     vad_model.reset_states()
     # Frames of audio being recorded
-    recorded_frames = None
+    recorded_frames = []
     # Whether we are recording or not
     is_recording = False
     # Number of quiet frames
     quiet_samples = 0
 
-    # Start streaming
-    print("Recording...")
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="int16",
-    ) as stream:
-        while True:
-            print("Reading...")
-            frame_i16, overflow = stream.read(FRAME_SIZE)
-            if overflow:
-                print("Overflow!")
+    print("Start receiving audio...")
+    # Create the queue for the recording callback
+    recording_queue = Queue()
 
-            # Convert the stereo audio to mono
-            frame_i16 = np.mean(frame_i16, axis=1, dtype="int16")
-            # Create a float32 version of the frame (required by the VAD model)
-            frame_f32 = (frame_i16 / 32768.0).astype("float32")
+    while True:
+        frame_i16 = recording_queue.get()
+        # Convert the stereo audio to mono
+        frame_i16 = np.mean(frame_i16, axis=1, dtype="int16")
+        # Create a float32 version of the frame (required by the VAD model)
+        frame_f32 = (frame_i16 / 32768.0).astype("float32")
 
-            # Run the VAD model
-            # model_out = vad_model(torch.from_numpy(frame_f32), sr=SAMPLE_RATE)
-            # Get the probability of speech
-            # speech_prob = model_out[0][0]
-            speech_prob = 0.1
+        # Run the VAD model
+        model_out = vad_model(torch.from_numpy(frame_f32), sr=RECORDING_SAMPLE_RATE)
+        # Get the probability of speech
+        speech_prob = model_out[:, 0].max()
+        print(f"Speech probability: {speech_prob:.2f}")
 
-            if not is_recording and speech_prob > 0.5:
-                print("Voice detected, start recording...")
-                is_recording = True
+        if not is_recording and speech_prob > 0.9:
+            print("Voice detected, start recording...")
+            is_recording = True
 
-            if is_recording:
-                # We check (with less sensitivity) if there is still speech
-                if speech_prob < 0.5:
-                    quiet_samples += len(frame_i16)
-                else:
-                    # If there is speech, we reset the counter
-                    quiet_samples = 0
+        # We append the frame to the list of recorded frames
+        recorded_frames = np.append(recorded_frames, frame_i16)
+
+        if is_recording:
+            # We check (with less sensitivity) if there is still speech
+            if speech_prob < 0.75:
+                quiet_samples += len(frame_i16)
             else:
-                # If we are not recording we still store the current frame, as it might contain the start of a sentence
-                recorded_frames = frame_i16
+                # If there is speech, we reset the counter
+                quiet_samples = 0
+        else:
+            # If we are not recording, we still keep the last KEPT_SAMPLES frames
+            recorded_frames = recorded_frames[-KEPT_SAMPLES:]
 
-            # If there are more than 10 quiet frames we consider the recording complete, and break the loop
-            if quiet_samples > NUM_MAX_QUITE_SAMPLES:
-                print("Voice stopped, stop recording...")
-                break
+        # If there are more than 10 quiet frames we consider the recording complete, and break the loop
+        if quiet_samples > NUM_MAX_QUITE_SAMPLES:
+            print("Voice stopped, stop recording...")
+            break
 
-            # Add the frame to the recording
-            recorded_frames = np.append(recorded_frames, frame_i16)
+    print("Recording finished")
+    recording_queue = None
 
-    # Convert to WebM
-    segment = pydub.AudioSegment(
-        recorded_frames,
-        frame_rate=SAMPLE_RATE,
-        sample_width=2,
-        channels=1,
-    )
-    audio_file = segment.export(format="webm", codec="libopus").read()
-    # Wrap the WebM file in a BytesIO object, so we can use it as a file
-    buffer = io.BytesIO(audio_file)
-    buffer.name = "recording.webm"
-    return buffer
+    sd.play(recorded_frames, RECORDING_SAMPLE_RATE)
+    sd.wait()
+
+    # # Convert to WebM
+    # segment = pydub.AudioSegment(
+    #     recorded_frames,
+    #     frame_rate=RECORDING_SAMPLE_RATE,
+    #     sample_width=2,
+    #     channels=1,
+    # )
+    # audio_file = segment.export(format="webm", codec="libopus").read()
+    # # Wrap the WebM file in a BytesIO object, so we can use it as a file
+    # buffer = io.BytesIO(audio_file)
+    # buffer.name = "recording.webm"
+
+
+#
+# # Save the file to the cache with a timestamp
+# timestamp = int(time())
+# with open(f"cache/{timestamp}.wav", "wb") as f:
+#     f.write(recorded_frames)
+#
+# return buffer
 
 
 def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bool:
@@ -200,7 +244,7 @@ def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bo
     # Upload the file to OpenAI
     print("Uploading...")
     response = client.audio.transcriptions.create(
-        file=webm_file, model="whisper-1", response_format="text"
+        file=webm_file, model="whisper-1", response_format="text", language="en"
     )
     print(response)
 
@@ -285,18 +329,30 @@ def main():
         os.mkdir("cache")
 
     welcome_message_samples = get_samples(get_welcome_message(), "aac")
-    while True:
-        wait_for_input()
-        print("Starting a new thread...")
-        thread = client.beta.threads.create()
-        while not handle_conversation(thread, welcome_message_samples):
-            print("Continuing the conversation...")
+    # We start "recording", as in we are receiving frames, but drop them until we need them
+    # This is done to avoid the delay when starting the recording, which is significant
+    with start_recording():
+        while True:
+            print("Starting a new conversation thread...")
+            thread = client.beta.threads.create()
+            wait_for_input()
+            while not handle_conversation(thread, welcome_message_samples):
+                print("Continuing the conversation...")
+
+
+def test_recording():
+    setup_input()
+
+    with start_recording():
+        while True:
+            print("Recording...")
+            wait_for_input()
+            record()
+            # print("Playing...")
+            # sd.play(samples)
+            # sd.wait()
 
 
 if __name__ == "__main__":
-    main()
-    # while True:
-    #     webm = record()
-    #     # Play the response
-    #     sd.play(get_samples(webm, "webm", "libopus"))
-    #     sd.wait()
+    # main()
+    test_recording()
