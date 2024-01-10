@@ -42,6 +42,7 @@ except ImportError:
 
 RESPEAKER_BUTTON = 17
 
+RECORDING_DEVICE = 0
 # Sample rate of the audio
 RECORDING_SAMPLE_RATE = 16000
 # How big each frame should be, which the callback will receive
@@ -131,10 +132,10 @@ def start_recording() -> io.BytesIO:
     # Start streaming
     print("Setting up recording...")
     return sd.InputStream(
+        device=RECORDING_DEVICE,
         samplerate=RECORDING_SAMPLE_RATE,
         channels=RECORDING_CHANNELS,
         blocksize=RECORDING_FRAME_SIZE,
-        dtype="int16",
         callback=record_callback,
     )
 
@@ -163,14 +164,14 @@ def record() -> io.BytesIO:
     recording_queue = Queue()
 
     while True:
-        frame_i16 = recording_queue.get()
+        frame = recording_queue.get()
+        print("Frame received")
+
         # Convert the stereo audio to mono
-        frame_i16 = np.mean(frame_i16, axis=1, dtype="int16")
-        # Create a float32 version of the frame (required by the VAD model)
-        frame_f32 = (frame_i16 / 32768.0).astype("float32")
+        frame = np.mean(frame, axis=1)
 
         # Run the VAD model
-        model_out = vad_model(torch.from_numpy(frame_f32), sr=RECORDING_SAMPLE_RATE)
+        model_out = vad_model(torch.from_numpy(frame), sr=RECORDING_SAMPLE_RATE)
         # Get the probability of speech
         speech_prob = model_out[:, 0].max()
         print(f"Speech probability: {speech_prob:.2f}")
@@ -180,12 +181,12 @@ def record() -> io.BytesIO:
             is_recording = True
 
         # We append the frame to the list of recorded frames
-        recorded_frames = np.append(recorded_frames, frame_i16)
+        recorded_frames = np.append(recorded_frames, frame)
 
         if is_recording:
             # We check (with less sensitivity) if there is still speech
             if speech_prob < 0.75:
-                quiet_samples += len(frame_i16)
+                quiet_samples += len(frame)
             else:
                 # If there is speech, we reset the counter
                 quiet_samples = 0
@@ -201,29 +202,19 @@ def record() -> io.BytesIO:
     print("Recording finished")
     recording_queue = None
 
-    sd.play(recorded_frames, RECORDING_SAMPLE_RATE)
-    sd.wait()
-
-    # # Convert to WebM
-    # segment = pydub.AudioSegment(
-    #     recorded_frames,
-    #     frame_rate=RECORDING_SAMPLE_RATE,
-    #     sample_width=2,
-    #     channels=1,
-    # )
-    # audio_file = segment.export(format="webm", codec="libopus").read()
-    # # Wrap the WebM file in a BytesIO object, so we can use it as a file
-    # buffer = io.BytesIO(audio_file)
-    # buffer.name = "recording.webm"
-
-
-#
-# # Save the file to the cache with a timestamp
-# timestamp = int(time())
-# with open(f"cache/{timestamp}.wav", "wb") as f:
-#     f.write(recorded_frames)
-#
-# return buffer
+    recorded_frames_i16 = (recorded_frames * 32767).astype(np.int16)
+    # Convert to WebM
+    segment = pydub.AudioSegment(
+        recorded_frames_i16,
+        frame_rate=RECORDING_SAMPLE_RATE,
+        sample_width=2,
+        channels=1,
+    )
+    audio_file = segment.export(format="webm", codec="libopus").read()
+    # Wrap the WebM file in a BytesIO object, so we can use it as a file
+    buffer = io.BytesIO(audio_file)
+    buffer.name = "recording.webm"
+    return buffer
 
 
 def handle_conversation(thread: Thread, welcome_message_samples: np.array) -> bool:
@@ -347,12 +338,12 @@ def test_recording():
         while True:
             print("Recording...")
             wait_for_input()
-            record()
-            # print("Playing...")
-            # sd.play(samples)
-            # sd.wait()
+            webm = record()
+            samples = get_samples(webm, "webm", "libopus")
+            sd.play(samples)
+            sd.wait()
 
 
 if __name__ == "__main__":
-    # main()
-    test_recording()
+    main()
+    # test_recording()
